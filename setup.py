@@ -19,7 +19,9 @@ setup(
     keywords='brewing brewpi brewblox embedded controller spark service',
     packages=find_packages(exclude=['test']),
     install_requires=[
+        'pyserial-asyncio==0.4',
+        'aiofiles~=0.4',
     ],
-    python_requires='>=3.6',
+    python_requires='>=3.7',
     setup_requires=['setuptools_scm'],
 )
