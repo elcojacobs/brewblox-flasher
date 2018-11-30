@@ -5,7 +5,6 @@ Communicates with devices using the YMODEM protocol
 import asyncio
 import math
 import os
-import re
 from logging import getLogger
 from typing import Awaitable, ByteString, List, NamedTuple
 
@@ -80,8 +79,8 @@ class FileSender():
     ABORT2 = 0x61       # 97
 
     PACKET_MARK = SOH
-    PACKET_LEN = 1024 if PACKET_MARK == STX else 128
-    EXPECTED_PACKET_LEN = PACKET_LEN+5
+    DATA_LEN = 1024 if PACKET_MARK == STX else 128
+    PACKET_LEN = DATA_LEN + 5
 
     def __init__(self, device: str = None, id: str = None):
         self._device = device
@@ -89,14 +88,13 @@ class FileSender():
 
     async def transfer(self, filename: str):
         conn = await self._connect()
-        LOGGER.info(dir(conn.transport.serial))
 
         try:
             LOGGER.info(f'Controller is in transfer mode, sending file {filename}')
             async with aiofiles.open(filename, 'rb') as file:
                 await file.seek(0, os.SEEK_END)
                 fsize = await file.tell()
-                num_packets = math.ceil(fsize / FileSender.PACKET_LEN)
+                num_packets = math.ceil(fsize / FileSender.DATA_LEN)
                 await file.seek(0, os.SEEK_SET)
 
                 LOGGER.info('Sending header...')
@@ -108,7 +106,7 @@ class FileSender():
                 for i in range(num_packets):
                     current = i + 1  # packet 0 was the header
                     LOGGER.info(f'Sending packet {current} / {num_packets}')
-                    data = await file.read(FileSender.PACKET_LEN)
+                    data = await file.read(FileSender.DATA_LEN)
                     state = await self._send_data(conn, current, list(data))
 
                     if state.response != FileSender.ACK:
@@ -139,7 +137,7 @@ class FileSender():
         else:
             raise TimeoutError('Controller did not enter file transfer mode')
 
-        if not re.match(r'Waiting for the binary file', buffer):
+        if 'Waiting for the binary file' not in buffer:
             raise ConnectionAbortedError(f'Failed to enter transfer mode: {buffer}')
 
         ack = 0
@@ -150,47 +148,38 @@ class FileSender():
 
         return conn
 
+    async def _send_close(self, conn: Connection):
+        # Send End Of Transfer
+        assert await self._send_packet(conn, [FileSender.EOT]) == FileSender.ACK
+        assert await self._send_packet(conn, [FileSender.EOT]) == FileSender.ACK
+
+        # Signal end of connection
+        await self._send_data(conn, 0, [])
+
     async def _send_header(self, conn: Connection, name: str, size: int) -> Awaitable[SendState]:
         data = [FileSender.PACKET_MARK, *name.encode(), 0, *f'{size} '.encode()]
         return await self._send_data(conn, 0, data)
 
     async def _send_data(self, conn: Connection, seq: int, data: List[int]) -> Awaitable[SendState]:
-        packet_data = data + [0] * (FileSender.PACKET_LEN - len(data))
+        packet_data = data + [0] * (FileSender.DATA_LEN - len(data))
         packet_seq = seq & 0xFF
         packet_seq_neg = 0xFF - packet_seq
         crc16 = [0, 0]
 
         packet = [FileSender.PACKET_MARK, packet_seq, packet_seq_neg, *packet_data, *crc16]
         if len(packet) != FileSender.EXPECTED_PACKET_LEN:
-            raise RuntimeError(f'Packet length mismatch: {len(packet)} / {FileSender.EXPECTED_PACKET_LEN}')
+            raise RuntimeError(f'Packet length mismatch: {len(packet)} / {FileSender.PACKET_LEN}')
 
-        await self._write(conn, packet)
-        response = await self._read(conn)
+        response = await self._send_packet(conn, packet)
 
         if response == FileSender.NAK:
             LOGGER.info('retrying packet...')
             await asyncio.sleep(1)
-            await self._write(conn, packet)
-            response = await self._read(conn)
+            response = await self._send_packet(conn, packet)
 
         return SendState(seq, response)
 
-    async def _send_close(self, conn: Connection):
-        # Send End Of Transfer
-        await self._write(conn, [FileSender.EOT])
-        assert await self._read(conn) == FileSender.ACK
-        await self._write(conn, [FileSender.EOT])
-        assert await self._read(conn) == FileSender.ACK
-
-        # Signal end of connection
-        await self._send_data(conn, 0, [])
-
-    async def _write(self, conn: Connection, packet: str) -> int:
+    async def _send_packet(self, conn: Connection, packet: str) -> int:
         conn.protocol.clear()
         conn.transport.write(bytes(packet))
-
-    async def _read(self, conn: Connection) -> int:
-        async def get():
-            return [int(i) for i in await conn.protocol.message]
-        resp = await get()
-        return resp[0]
+        return [int(i) for i in await conn.protocol.message][0]
