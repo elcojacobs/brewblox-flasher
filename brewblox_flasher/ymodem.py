@@ -3,26 +3,36 @@ Communicates with devices using the YMODEM protocol
 """
 
 import asyncio
+import math
+import os
 import re
 from logging import getLogger
-from typing import Awaitable
+from typing import Awaitable, ByteString, List, NamedTuple
+
+import aiofiles
 
 from brewblox_flasher import serial_connection
+from brewblox_flasher.serial_connection import Connection
 
 YMODEM_TRIGGER_BAUD_RATE = 28800
+YMODEM_TRANSFER_BAUD_RATE = 9600
 
 LOGGER = getLogger(__name__)
 
 
+class SendState(NamedTuple):
+    seq: int
+    response: int
+
+
 class FileSenderProtocol(asyncio.Protocol):
-    def __init__(self, loop: asyncio.BaseEventLoop):
-        self._loop = loop
+    def __init__(self):
+        self._loop = asyncio.get_event_loop()
         self._connection_made_event = asyncio.Event()
-        self._queue = asyncio.Queue(loop=loop)
-        self._buffer = ''
+        self._queue = asyncio.Queue()
 
     @property
-    def message(self) -> Awaitable[str]:
+    def message(self) -> Awaitable[ByteString]:
         return self._queue.get()
 
     @property
@@ -36,43 +46,151 @@ class FileSenderProtocol(asyncio.Protocol):
         pass
 
     def data_received(self, data):
-        self._buffer += data.decode()
+        LOGGER.info(f'recv: {data}')
+        self._loop.create_task(self._queue.put(data))
 
-        def extract_message(matchobj) -> str:
-            msg = matchobj.group('message').rstrip()
-            self._loop.create_task(self._queue.put(msg))
-            return ''
-
-        while re.search(r'.*^.*\n', self._buffer):
-            self._buffer = re.sub(
-                pattern=r'^(?P<message>[^^]*?)\n',
-                repl=extract_message,
-                string=self._buffer,
-                count=1
-            )
-
-    def on_data(self, msg: str):
-        LOGGER.info(f'msg: {msg}')
-        if msg.startswith('Waiting for the binary file'):
-            self._readable_event.set()
+    def clear(self):
+        for i in range(self._queue.qsize()):
+            self._queue.get_nowait()
 
 
-async def trigger_ymodem(device: str = None, id: str = None):
-    conn = await serial_connection.connect(device, id, YMODEM_TRIGGER_BAUD_RATE)
-    conn.transport.close()
+class FileSender():
+    """
+    Receive_Packet
+    - first byte SOH/STX (for 128/1024 byte size packets)
+    - EOT (end)
+    - CA CA abort
+    - ABORT1 or ABORT2 is abort
+    Then 2 bytes for seq-no (although the sequence number isn't checked)
+    Then the packet data
+    Then CRC16?
+    First packet sent is a filename packet:
+    - zero-terminated filename
+    - file size (ascii) followed by space?
+    """
 
+    SOH = 1     # 128 byte blocks
+    STX = 2     # 1K blocks
+    EOT = 4
+    ACK = 6
+    NAK = 0x15
+    CA = 0x18           # 24
+    CRC16 = 0x43        # 67
+    ABORT1 = 0x41       # 65
+    ABORT2 = 0x61       # 97
 
-async def send_file(filename: str, device: str = None, id: str = None):
-    loop = asyncio.get_event_loop()
-    conn = await serial_connection.connect(
-        device,
-        id,
-        YMODEM_TRIGGER_BAUD_RATE,
-        lambda: FileSenderProtocol(loop),
-    )
-    await conn.protocol.connected
-    conn.transport.write(b'f')
-    while not (await conn.protocol.message).startswith('Waiting for the binary file'):
-        pass
-    conn.transport.close()
-    await conn.protocol.disconnected
+    PACKET_MARK = SOH
+    PACKET_LEN = 1024 if PACKET_MARK == STX else 128
+    EXPECTED_PACKET_LEN = PACKET_LEN+5
+
+    def __init__(self, device: str = None, id: str = None):
+        self._device = device
+        self._id = id
+
+    async def transfer(self, filename: str):
+        conn = await self._connect()
+        LOGGER.info(dir(conn.transport.serial))
+
+        try:
+            LOGGER.info(f'Controller is in transfer mode, sending file {filename}')
+            async with aiofiles.open(filename, 'rb') as file:
+                await file.seek(0, os.SEEK_END)
+                fsize = await file.tell()
+                num_packets = math.ceil(fsize / FileSender.PACKET_LEN)
+                await file.seek(0, os.SEEK_SET)
+
+                LOGGER.info('Sending header...')
+                state: SendState = await self._send_header(conn, 'binary', fsize)
+
+                if state.response != FileSender.ACK:
+                    raise ConnectionAbortedError(f'Failed with code {state.response} while sending header')
+
+                for i in range(num_packets):
+                    current = i + 1  # packet 0 was the header
+                    LOGGER.info(f'Sending packet {current} / {num_packets}')
+                    data = await file.read(FileSender.PACKET_LEN)
+                    state = await self._send_data(conn, current, list(data))
+
+                    if state.response != FileSender.ACK:
+                        raise ConnectionAbortedError(
+                            f'Failed with code {state.response} while sending package {current}')
+
+                await self._send_close(conn)
+
+        finally:
+            conn.transport.close()
+
+    async def _connect(self):
+        # Trigger listening mode
+        conn = await serial_connection.connect(self._device, self._id, YMODEM_TRIGGER_BAUD_RATE)
+        conn.transport.close()
+
+        # Connect
+        conn = await serial_connection.connect(self._device, self._id, YMODEM_TRANSFER_BAUD_RATE, FileSenderProtocol)
+        await conn.protocol.connected
+
+        # Trigger YMODEM mode
+        buffer = ''
+        conn.transport.write(b'f')
+        for i in range(10):
+            buffer += (await conn.protocol.message).decode()
+            if '\n' in buffer:
+                break
+        else:
+            raise TimeoutError('Controller did not enter file transfer mode')
+
+        if not re.match(r'Waiting for the binary file', buffer):
+            raise ConnectionAbortedError(f'Failed to enter transfer mode: {buffer}')
+
+        ack = 0
+        while ack < 2:
+            conn.transport.write(b' ')
+            if (await conn.protocol.message)[0] == FileSender.ACK:
+                ack += 1
+
+        return conn
+
+    async def _send_header(self, conn: Connection, name: str, size: int) -> Awaitable[SendState]:
+        data = [FileSender.PACKET_MARK, *name.encode(), 0, *f'{size} '.encode()]
+        return await self._send_data(conn, 0, data)
+
+    async def _send_data(self, conn: Connection, seq: int, data: List[int]) -> Awaitable[SendState]:
+        packet_data = data + [0] * (FileSender.PACKET_LEN - len(data))
+        packet_seq = seq & 0xFF
+        packet_seq_neg = 0xFF - seq
+        crc16 = [0, 0]
+
+        packet = [FileSender.PACKET_MARK, packet_seq, packet_seq_neg, *packet_data, *crc16]
+        if len(packet) != FileSender.EXPECTED_PACKET_LEN:
+            raise RuntimeError(f'Packet length mismatch: {len(packet)} / {FileSender.EXPECTED_PACKET_LEN}')
+
+        await self._write(conn, packet)
+        response = await self._read(conn)
+
+        if response == FileSender.NAK:
+            LOGGER.info('retrying packet...')
+            await asyncio.sleep(1)
+            await self._write(conn, packet)
+            response = await self._read(conn)
+
+        return SendState(seq, response)
+
+    async def _send_close(self, conn: Connection):
+        # Send End Of Transfer
+        await self._write(conn, [FileSender.EOT])
+        assert await self._read(conn) == FileSender.ACK
+        await self._write(conn, [FileSender.EOT])
+        assert await self._read(conn) == FileSender.ACK
+
+        # Signal end of connection
+        await self._send_data(conn, 0, [])
+
+    async def _write(self, conn: Connection, packet: str) -> int:
+        conn.protocol.clear()
+        conn.transport.write(bytes(packet))
+
+    async def _read(self, conn: Connection) -> int:
+        async def get():
+            return [int(i) for i in await conn.protocol.message]
+        resp = await get()
+        return resp[0]
