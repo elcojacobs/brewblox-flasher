@@ -157,7 +157,7 @@ class FileSender():
     async def _send_data(self, conn: Connection, seq: int, data: List[int]) -> Awaitable[SendState]:
         packet_data = data + [0] * (FileSender.PACKET_LEN - len(data))
         packet_seq = seq & 0xFF
-        packet_seq_neg = 0xFF - seq
+        packet_seq_neg = 0xFF - packet_seq
         crc16 = [0, 0]
 
         packet = [FileSender.PACKET_MARK, packet_seq, packet_seq_neg, *packet_data, *crc16]
