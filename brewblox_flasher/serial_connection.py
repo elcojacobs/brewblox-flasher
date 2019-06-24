@@ -102,7 +102,7 @@ async def connect(device: str = None,
                   baudrate: int = DEFAULT_BAUD_RATE,
                   factory: Callable[[], asyncio.Protocol] = SerialProtocol
                   ) -> Awaitable[Connection]:
-    address = detect_device(device, id)
+    address = "socket://192.168.0.78:9393" # detect_device(device, id)
     protocol = factory()
     ser = serial.serial_for_url(address, baudrate=baudrate)
     transport = SerialTransport(asyncio.get_event_loop(), protocol, ser)

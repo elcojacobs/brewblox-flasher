@@ -78,7 +78,7 @@ class FileSender():
     ABORT1 = 0x41       # 65
     ABORT2 = 0x61       # 97
 
-    PACKET_MARK = SOH
+    PACKET_MARK = STX
     DATA_LEN = 1024 if PACKET_MARK == STX else 128
     PACKET_LEN = DATA_LEN + 5
 
@@ -120,25 +120,25 @@ class FileSender():
 
     async def _connect(self):
         # Trigger listening mode
-        conn = await serial_connection.connect(self._device, self._id, YMODEM_TRIGGER_BAUD_RATE)
-        conn.transport.close()
+#        conn = await serial_connection.connect(self._device, self._id, YMODEM_TRIGGER_BAUD_RATE)
+#        conn.transport.close()
 
         # Connect
         conn = await serial_connection.connect(self._device, self._id, YMODEM_TRANSFER_BAUD_RATE, FileSenderProtocol)
         await conn.protocol.connected
 
         # Trigger YMODEM mode
-        buffer = ''
-        conn.transport.write(b'f')
-        for i in range(10):
-            buffer += (await conn.protocol.message).decode()
-            if '\n' in buffer:
-                break
-        else:
-            raise TimeoutError('Controller did not enter file transfer mode')
+#        buffer = ''
+#        conn.transport.write(b'f')
+#        for i in range(10):
+#            buffer += (await conn.protocol.message).decode()
+#            if '\n' in buffer:
+#                break
+#        else:
+#            raise TimeoutError('Controller did not enter file transfer mode')
 
-        if 'Waiting for the binary file' not in buffer:
-            raise ConnectionAbortedError(f'Failed to enter transfer mode: {buffer}')
+#        if 'Waiting for the binary file' not in buffer:
+#           raise ConnectionAbortedError(f'Failed to enter transfer mode: {buffer}')
 
         ack = 0
         while ack < 2:
@@ -167,7 +167,7 @@ class FileSender():
         crc16 = [0, 0]
 
         packet = [FileSender.PACKET_MARK, packet_seq, packet_seq_neg, *packet_data, *crc16]
-        if len(packet) != FileSender.EXPECTED_PACKET_LEN:
+        if len(packet) != FileSender.PACKET_LEN:
             raise RuntimeError(f'Packet length mismatch: {len(packet)} / {FileSender.PACKET_LEN}')
 
         response = await self._send_packet(conn, packet)
@@ -182,4 +182,9 @@ class FileSender():
     async def _send_packet(self, conn: Connection, packet: str) -> int:
         conn.protocol.clear()
         conn.transport.write(bytes(packet))
-        return [int(i) for i in await conn.protocol.message][0]
+        while True:
+            retv = [int(i) for i in await conn.protocol.message][0]
+            if retv != FileSender.CRC16:
+                break
+
+        return retv
